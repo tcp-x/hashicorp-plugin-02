@@ -1,0 +1,282 @@
+I am trying to develop a golang hashicorp go-plugin based on their published example.
+While the example exposes a method Greet() that does not take any argument, I am trying to expose a method CdExec(req) that accepts one argument of json string.
+The respose should also resond with a json string with two fields 'data' and 'status'.
+I am currently getting and error: panic: interface conversion: *iExec.CdExecutorRPCClient is not iExec.CdExecutor: missing method CdExec
+This is suggesting that CdExec is not missing but I already have it implemented. Perhaps someone can guide on why this error is being thrown.
+There are 3 main source codes involved.
+1. A shared interface which is imported as: shared "github.com/tcp-x/cd-plug-util". Which is published from a seperate project
+2. A source code for plugin
+3. Main file for loading the plugin
+
+----------------------------
+Shared Interface source file
+----------------------------
+
+// package shared contains the shared interface definition
+package iExec
+
+import (
+	"fmt"
+	"net/rpc"
+
+	"github.com/hashicorp/go-plugin"
+)
+
+// CdExecutor represents the interface for executing commands in a plugin.
+type CdExecutor interface {
+	// CdExec is a method that executes a command and returns the result.
+	CdExec(jsonInput string) (string, error)
+}
+
+// Here is an implementation that talks over RPC
+type CdExecutorRPCClient struct {
+	client *rpc.Client
+}
+
+func (g *CdExecutorRPCClient) CdExec(req string) string {
+	var resp string
+	err := g.client.Call("Plugin.CdExec", new(interface{}), &resp)
+	if err != nil {
+		// You usually want your interfaces to return errors. If they don't,
+		// there isn't much other choice here.
+		panic(err)
+	}
+
+	return resp
+}
+
+// Here is the RPC server that CdExecutorRPC talks to, conforming to
+// the requirements of net/rpc
+type CdExecutorRPCServer struct {
+	// This is the real implementation
+	Impl CdExecutor
+}
+
+// func (s *CdExecutorRPCServer) CdExec(args interface{}, resp *string) error {
+// 	*resp = s.Impl.CdExec()
+// 	return nil
+// }
+
+func (s *CdExecutorRPCServer) CdExec(args interface{}, resp *string) error {
+	fmt.Println("CdExecutorRPCServer::args:", args)
+	// req := args.(string)
+	*resp, _ = s.Impl.CdExec("xxx")
+	return nil
+}
+
+// This is the implementation of plugin.Plugin so we can serve/consume this
+//
+// This has two methods: Server must return an RPC server for this plugin
+// type. We construct a CdExecutorRPCServer for this.
+//
+// Client must return an implementation of our interface that communicates
+// over an RPC client. We return CdExecutorRPC for this.
+//
+// Ignore MuxBroker. That is used to create more multiplexed streams on our
+// plugin connection and is a more advanced use case.
+type CdExecutorPlugin struct {
+	// Impl Injection
+	Impl CdExecutor
+}
+
+func (p *CdExecutorPlugin) Server(*plugin.MuxBroker) (interface{}, error) {
+	return &CdExecutorRPCServer{Impl: p.Impl}, nil
+}
+
+func (CdExecutorPlugin) Client(b *plugin.MuxBroker, c *rpc.Client) (interface{}, error) {
+	return &CdExecutorRPCClient{client: c}, nil
+}
+
+-------------------------------
+Plugin Source file
+-------------------------------
+
+package main
+
+import (
+	"encoding/json"
+	"os"
+
+	"github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/go-plugin"
+	shared "github.com/tcp-x/cd-plug-util" // Import the shared package
+)
+
+type CdExecutorPlugin struct {
+	logger hclog.Logger
+}
+
+// CdExec is the method that executes a command and returns the result.
+func (exec *CdExecutorPlugin) CdExec(jsonInput string) (string, error) {
+	exec.logger.Debug("message from CdExecutorPlugin.CdExec")
+	// Parse the JSON input
+	var input map[string]interface{}
+	err := json.Unmarshal([]byte(jsonInput), &input)
+	if err != nil {
+		return "", err
+	}
+
+	// Your logic here to execute the command based on the input
+	// For demonstration, let's just return a JSON response
+	response := map[string]interface{}{
+		"data":   "Your result data",
+		"status": "success",
+	}
+	responseJSON, err := json.Marshal(response)
+	if err != nil {
+		return "", err
+	}
+	return string(responseJSON), nil
+}
+
+var handshakeConfig = plugin.HandshakeConfig{
+	ProtocolVersion:  1,
+	MagicCookieKey:   "BASIC_PLUGIN",
+	MagicCookieValue: "hello",
+}
+
+func main() {
+	logger := hclog.New(&hclog.LoggerOptions{
+		Level:      hclog.Trace,
+		Output:     os.Stderr,
+		JSONFormat: true,
+	})
+
+	exec := &CdExecutorPlugin{
+		logger: logger,
+	}
+
+	// pluginMap is the map of plugins we can dispense.
+	var pluginMap = map[string]plugin.Plugin{
+		"cd_executor": &shared.CdExecutorPlugin{Impl: exec},
+	}
+
+	logger.Debug("message from plugin", "foo", "bar")
+	// Serve the plugin using the CdExecutorPlugin
+	plugin.Serve(&plugin.ServeConfig{
+		HandshakeConfig: handshakeConfig,
+		Plugins:         pluginMap,
+	})
+}
+
+
+----------------------------
+Main file to load the plugin
+----------------------------
+
+package main
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+
+	hclog "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/go-plugin"
+	shared "github.com/tcp-x/cd-plug-util" // Import the shared package
+)
+
+// handshakeConfigs are used to just do a basic handshake between
+// a plugin and host. If the handshake fails, a user friendly error is shown.
+// This prevents users from executing bad plugins or executing a plugin
+// directory. It is a UX feature, not a security feature.
+var handshakeConfig = plugin.HandshakeConfig{
+	ProtocolVersion:  1,
+	MagicCookieKey:   "BASIC_PLUGIN",
+	MagicCookieValue: "hello",
+}
+
+// pluginMap is the map of plugins we can dispense.
+var pluginMap = map[string]plugin.Plugin{
+	"cd_executor": &shared.CdExecutorPlugin{},
+}
+
+func main() {
+	// Create an hclog.Logger
+	logger := hclog.New(&hclog.LoggerOptions{
+		Name:   "plugin",
+		Output: os.Stdout,
+		Level:  hclog.Debug,
+	})
+
+	// Create a plugin client
+	client := plugin.NewClient(&plugin.ClientConfig{
+		HandshakeConfig: handshakeConfig,
+		Plugins:         pluginMap,
+		Cmd:             exec.Command("./plugin/executor"),
+		Logger:          logger,
+	})
+
+	// Connect via RPC
+	rpcClient, err := client.Client()
+	if err != nil {
+		log.Fatal("Error connecting:", err)
+	}
+	// defer rpcClient.Close()
+	defer client.Kill()
+
+	// Request the plugin
+	raw, err := rpcClient.Dispense("cd_executor")
+	if err != nil {
+		log.Fatal("Error getting plugin:", err)
+	}
+	executor := raw.(shared.CdExecutor)
+
+	// Example input JSON string
+	input := `{"key": "value"}`
+
+	// Call the CdExec method of the plugin
+	result, err := executor.CdExec(input)
+	if err != nil {
+		log.Fatal("Error calling CdExec:", err)
+	}
+
+	fmt.Println("Plugin Result:", result)
+}
+
+----------------------------------------
+Compilation script
+---------------------------------------
+
+go build -o ./plugin/executor ./plugin/plugin.go
+go build -o CdPluginHost .
+
+-------------------------
+running
+----------------------
+./CdPluginHost
+
+------------------------------
+project directory
+-----------------------------
+
+├── bug-report-01
+├── build.sh
+├── CdPluginHost
+├── go.mod
+├── go.sum
+├── main.go
+└── plugin
+    ├── executor
+    ├── go.mod
+    ├── go.sum
+    └── plugin.go
+
+----------------------------------------
+Current output:
+--------------------------------------
+2024-03-09T00:26:30.564+0300 [DEBUG] plugin: starting plugin: path=./plugin/executor args=[./plugin/executor]
+2024-03-09T00:26:30.565+0300 [DEBUG] plugin: plugin started: path=./plugin/executor pid=149938
+2024-03-09T00:26:30.565+0300 [DEBUG] plugin: waiting for RPC address: plugin=./plugin/executor
+2024-03-09T00:26:30.574+0300 [DEBUG] plugin.executor: message from plugin: foo=bar timestamp=2024-03-09T00:26:30.573+0300
+2024-03-09T00:26:30.574+0300 [DEBUG] plugin.executor: plugin address: address=/tmp/plugin3107631768 network=unix timestamp=2024-03-09T00:26:30.574+0300
+2024-03-09T00:26:30.574+0300 [DEBUG] plugin: using plugin: version=1
+2024-03-09T00:26:30.577+0300 [DEBUG] plugin.executor: 2024/03/09 00:26:30 [DEBUG] plugin: plugin server: accept unix /tmp/plugin3107631768: use of closed network connection
+2024-03-09T00:26:30.577+0300 [INFO]  plugin: plugin process exited: plugin=./plugin/executor id=149938
+2024-03-09T00:26:30.578+0300 [DEBUG] plugin: plugin exited
+panic: interface conversion: *iExec.CdExecutorRPCClient is not iExec.CdExecutor: missing method CdExec
+
+goroutine 1 [running]:
+main.main()
+        /media/emp-06/disk-01/download-bu/golang/plugins/hashicorp plugin/hashicorp-plugin-02/main.go:58 +0x2f0
